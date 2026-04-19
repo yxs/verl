@@ -283,6 +283,10 @@ class RolloutConfig(BaseConfig):
 
     enable_sleep_mode: bool = True
 
+    # Load-balance strategy for GlobalRequestLoadBalancer. See roadmap #5442.
+    load_balance_strategy: str = "least_requests"
+    lb_metric_poll_interval_s: float = 1.0
+
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
     qat: Optional[dict] = None
@@ -332,6 +336,31 @@ class RolloutConfig(BaseConfig):
             if self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
+                )
+
+        # Validate load_balance_strategy + interactions.
+        valid_strategies = {"least_requests", "least_kv_cache"}
+        if self.load_balance_strategy not in valid_strategies:
+            raise ValueError(
+                f"rollout.load_balance_strategy={self.load_balance_strategy!r} is not supported; "
+                f"choose one of {sorted(valid_strategies)}"
+            )
+        if self.load_balance_strategy == "least_kv_cache":
+            if self.name != "vllm":
+                raise ValueError(
+                    f"rollout.load_balance_strategy='least_kv_cache' only supports rollout.name='vllm' "
+                    f"in this release (got {self.name!r}); SGLang/TRTLLM support is tracked as a "
+                    "follow-up to #5442."
+                )
+            if self.disable_log_stats:
+                raise ValueError(
+                    "rollout.load_balance_strategy='least_kv_cache' requires "
+                    "rollout.disable_log_stats=False so that vLLM populates the "
+                    "vllm:kv_cache_usage_perc Prometheus gauge."
+                )
+            if self.lb_metric_poll_interval_s <= 0:
+                raise ValueError(
+                    f"rollout.lb_metric_poll_interval_s must be positive, got {self.lb_metric_poll_interval_s}"
                 )
 
 

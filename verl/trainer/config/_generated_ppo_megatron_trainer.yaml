@@ -286,6 +286,8 @@ actor_rollout_ref:
     enable_prefix_caching: true
     logprobs_mode: processed_logprobs
     scheduling_policy: fcfs
+    load_balance_strategy: least_requests
+    lb_metric_poll_interval_s: 1.0
     load_format: dummy
     layered_summon: false
     log_prob_micro_batch_size: null

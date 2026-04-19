@@ -87,6 +87,12 @@ logprobs_mode: processed_logprobs
 # scheduling policy for vllm rollout
 scheduling_policy: fcfs
 
+# Load-balance strategy: least_requests | least_kv_cache. See #5442.
+load_balance_strategy: least_requests
+
+# Poll interval (s) for least_kv_cache metric scraper.
+lb_metric_poll_interval_s: 1.0
+
 # Which loader to use for rollout model weights: dummy, hf, megatron, etc.
 # safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
 load_format: dummy

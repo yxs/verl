@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.experimental.agent_loop.load_balance import LeastRequestsStrategy, LoadBalanceStrategy
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.teacher_loop import TeacherModelManager
@@ -64,27 +65,43 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 @ray.remote
 class GlobalRequestLoadBalancer:
-    """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers."""
+    """Global sticky-session + pluggable-strategy load balancer shared by all AgentLoopWorkers."""
 
-    def __init__(self, server_actor_ids: list[str], max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE):
+    def __init__(
+        self,
+        server_actor_ids: list[str],
+        max_cache_size: int = DEFAULT_ROUTING_CACHE_SIZE,
+        strategy: Optional[LoadBalanceStrategy] = None,
+    ):
         if not server_actor_ids:
             raise ValueError("server_actor_ids must be non-empty")
 
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in server_actor_ids}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
 
-    def acquire_server(self, request_id: str) -> str:
+        self._strategy: LoadBalanceStrategy = strategy if strategy is not None else LeastRequestsStrategy()
+        self._strategy.register_servers(list(server_actor_ids), self._inflight_requests)
+        # Lazy-start strategy on first acquire_server (Ray actor __init__ is sync).
+        self._strategy_started = False
+
+    async def acquire_server(self, request_id: str) -> str:
         """Acquire a server for the given request, reusing the same server for multi-turn conversations."""
+        if not self._strategy_started:
+            await self._strategy.start()
+            self._strategy_started = True
+
         # request-level sticky (multi-turn: same conversation -> same server)
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
             self._inflight_requests[server_id] += 1
+            self._strategy.on_acquire(server_id)
             return server_id
 
-        # new request: route to least loaded server
-        server_id = min(self._inflight_requests, key=self._inflight_requests.get)
+        # new request: delegate to strategy
+        server_id = self._strategy.pick(request_id)
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
+        self._strategy.on_acquire(server_id)
         return server_id
 
     def release_server(self, server_id: str) -> None:
@@ -94,6 +111,13 @@ class GlobalRequestLoadBalancer:
         if self._inflight_requests[server_id] <= 0:
             raise ValueError(f"Release called with no inflight requests on server {server_id}")
         self._inflight_requests[server_id] -= 1
+        self._strategy.on_release(server_id)
+
+    async def stop(self) -> None:
+        """Cancel any background tasks owned by the strategy. Idempotent."""
+        if self._strategy_started:
+            await self._strategy.stop()
+            self._strategy_started = False
 
 
 def _get_rollout_and_model_config(config: DictConfig) -> tuple[DictConfig, DictConfig]:
@@ -1158,9 +1182,19 @@ class AgentLoopManager:
             )
 
     async def _init_global_load_balancer(self) -> None:
+        strategy_name = getattr(self.rollout_config, "load_balance_strategy", "least_requests")
+        if strategy_name == "least_kv_cache":
+            from verl.experimental.agent_loop.load_balance import LeastKVCacheStrategy
+
+            poll_interval = getattr(self.rollout_config, "lb_metric_poll_interval_s", 1.0)
+            strategy = LeastKVCacheStrategy(poll_interval_s=poll_interval)
+        else:
+            strategy = None  # default constructed inside LB
+
         self.global_load_balancer = GlobalRequestLoadBalancer.remote(
             server_actor_ids=self.server_addresses,
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+            strategy=strategy,
         )
 
     @auto_await
